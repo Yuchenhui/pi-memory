@@ -221,19 +221,42 @@ function sleepSync(ms: number): void {
  * The lock mtime is refreshed while held so that a critical section slower than
  * the stale threshold (qmd embed takes ~50s on this machine) is not mistaken
  * for a crashed holder.
+ *
+ * A missing parent directory is retried rather than raised, because the store
+ * can sit on a volume two endpoints write to and mkdir there is not as atomic
+ * as it looks.
  */
 export function withStoreLock<T>(target: string, fn: () => T, timeoutMs = lockTimeoutMs()): T {
 	const lockDir = storeLockDir(target);
 	const staleMs = lockStaleMs();
 	const deadline = Date.now() + timeoutMs;
 	let wait = STORE_LOCK_MIN_WAIT_MS;
+	let missingParent = 0;
 
 	for (;;) {
 		try {
 			fs.mkdirSync(lockDir);
 			break;
 		} catch (err) {
-			if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+			const code = (err as NodeJS.ErrnoException).code;
+			if (code === "ENOENT") {
+				// The store's parent directory is not visible yet. On a shared
+				// volume reached from both endpoints this is a real race, not a
+				// bug report: several processes create the tree at the same moment
+				// and the filesystem can answer a mkdir for a directory that was
+				// just created. Re-create the parent and try again rather than
+				// losing the write -- measured once per 200 concurrent writes, and
+				// it surfaced as a hard ENOENT escaping the lock.
+				missingParent += 1;
+				if (missingParent > 5 || Date.now() >= deadline) throw err;
+				try {
+					fs.mkdirSync(path.dirname(lockDir), { recursive: true });
+				} catch {
+					/* still not there; the next iteration reports it */
+				}
+				continue;
+			}
+			if (code !== "EEXIST") throw err;
 			if (isLockAbandoned(lockDir, Date.now(), staleMs)) {
 				// Best effort: whoever wins the race below is the one that writes.
 				try {

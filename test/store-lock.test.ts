@@ -87,6 +87,16 @@ describe("withStoreLock", () => {
 		}
 	});
 
+	test("creates a missing store directory instead of failing the write", () => {
+		// mkdir for a lock can come back ENOENT on a volume two endpoints share,
+		// when the tree is being created at that exact moment. The write must
+		// survive that; the retry is bounded so a genuinely absent path still
+		// surfaces as an error rather than spinning.
+		const nested = path.join(dir, "does", "not", "exist", "daily", "2026-10-05.md");
+		expect(withStoreLock(nested, () => "acquired", 5_000)).toBe("acquired");
+		expect(fs.existsSync(path.join(dir, "does", "not", "exist", "daily"))).toBe(true);
+	});
+
 	test("keeps a slow critical section from looking abandoned", async () => {
 		// Threshold 3s, heartbeat at 1s. The holder lives in another process
 		// because the critical section blocks its thread. Without the heartbeat
