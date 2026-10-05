@@ -125,6 +125,231 @@ export function readFileSafe(filePath: string): string | null {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Cross-process store locking
+//
+// Every write in this file used to be a bare read-modify-write: read the whole
+// file, concatenate, truncate and write it back. Two processes pointed at the
+// same store therefore lose updates silently -- the second writer's stale copy
+// overwrites whatever the first one appended, and nothing reports an error.
+// Measured with 8 concurrent processes straddling a Windows/WSL boundary: 120
+// write attempts, 86 of them reported success, 26 entries on disk. Seventy
+// percent of the "successful" writes were gone, with no error anywhere.
+//
+// The fix has three parts and all three matter:
+//
+//   1. A mkdir-based lock. mkdir is atomic on every filesystem this extension
+//      is used on, including NTFS reached from WSL through /mnt/c, where a
+//      plain O_EXCL create fails the other way round. A lock *directory*
+//      rather than a lock *file* so a crashed holder can be reclaimed by
+//      age without having to parse a lockfile.
+//   2. Re-reading the target INSIDE the lock. This is the step that actually
+//      fixes lost updates. Locking a read-modify-write whose read happened
+//      before the lock is acquired serializes the writes and still loses data.
+//   3. Replacing the file with tmp + rename instead of truncating in place.
+//      Lock-free readers exist and cannot be made to cooperate: the context
+//      snapshot, memory_read, qmd's indexer, and any editor with the file
+//      open. Truncating in place makes them observe a half-written file --
+//      measured at 99% of reads during a concurrent write. rename() is atomic,
+//      so those readers see the old file or the new file and nothing in
+//      between; the cost is that Windows refuses the rename while somebody
+//      holds the file open, which is a stall and therefore worth retrying.
+//
+// With every write path routed through withStoreLock + writeFileAtomic, a
+// reader that takes no lock is always consistent. That invariant is what makes
+// the rest of the extension safe to leave unlocked.
+//
+// Benchmark and reproduction live in pc-tweaks/pi/memory-stress.
+// ---------------------------------------------------------------------------
+
+/** Age after which a lock left behind by a crashed process is reclaimed. */
+function lockStaleMs(): number {
+	// Read per acquisition rather than once at load: the value is a knob, and a
+	// test that wants a different threshold should not need a module reload.
+	return Number(process.env.PI_MEMORY_LOCK_STALE_MS ?? 30_000);
+}
+
+/** How long a writer waits for the lock before giving up. */
+function lockTimeoutMs(): number {
+	return Number(process.env.PI_MEMORY_LOCK_TIMEOUT_MS ?? 300_000);
+}
+
+const STORE_LOCK_MIN_WAIT_MS = 100;
+const STORE_LOCK_MAX_WAIT_MS = 1_000;
+/** Default budget for rename retries against a lock-free reader holding the file. */
+const STORE_RENAME_BUDGET_MS = Number(process.env.PI_MEMORY_RENAME_BUDGET_MS ?? 30_000);
+const STORE_RENAME_RETRY_MS = 60;
+
+/**
+ * Windows reports a rename blocked by another process as EPERM, EACCES or
+ * EBUSY depending on the caller's runtime and the other side's share flags.
+ * All of them mean "try again", never "give up": the target is intact.
+ */
+const TRANSIENT_SHARE_ERRNOS = new Set(["EPERM", "EACCES", "EBUSY", "ENOTEMPTY"]);
+
+export function isTransientShareError(err: unknown): boolean {
+	const code = (err as NodeJS.ErrnoException | undefined)?.code;
+	return typeof code === "string" && TRANSIENT_SHARE_ERRNOS.has(code);
+}
+
+export function storeLockDir(target: string): string {
+	return `${target}.lock`;
+}
+
+/** Reclaim a lock whose holder died without releasing it. */
+function isLockAbandoned(lockDir: string, now = Date.now(), staleMs = lockStaleMs()): boolean {
+	try {
+		return now - fs.statSync(lockDir).mtimeMs > staleMs;
+	} catch {
+		// Vanished between the failed mkdir and the stat: someone released it.
+		return false;
+	}
+}
+
+function sleepSync(ms: number): void {
+	// execFileSync is a poor man's Atomics.wait and works on every runtime that
+	// can run this extension; the critical sections are microseconds long.
+	const shared = new Int32Array(new SharedArrayBuffer(4));
+	Atomics.wait(shared, 0, 0, ms);
+}
+
+/**
+ * Run fn while holding the store lock for target. Synchronous on purpose: every
+ * critical section is a read plus a rename, and keeping it synchronous means
+ * there is no window between "read" and "write" for another task to slip into.
+ *
+ * The lock mtime is refreshed while held so that a critical section slower than
+ * the stale threshold (qmd embed takes ~50s on this machine) is not mistaken
+ * for a crashed holder.
+ */
+export function withStoreLock<T>(target: string, fn: () => T, timeoutMs = lockTimeoutMs()): T {
+	const lockDir = storeLockDir(target);
+	const staleMs = lockStaleMs();
+	const deadline = Date.now() + timeoutMs;
+	let wait = STORE_LOCK_MIN_WAIT_MS;
+
+	for (;;) {
+		try {
+			fs.mkdirSync(lockDir);
+			break;
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+			if (isLockAbandoned(lockDir, Date.now(), staleMs)) {
+				// Best effort: whoever wins the race below is the one that writes.
+				try {
+					fs.rmSync(lockDir, { recursive: true, force: true });
+				} catch {
+					/* another process reclaimed it first */
+				}
+				continue;
+			}
+			if (Date.now() >= deadline) {
+				throw new Error(
+					`Timed out after ${timeoutMs}ms waiting for the memory store lock: ${lockDir}. ` +
+						`Another pi process is writing ${target}. If none is running, delete ${lockDir}.`,
+				);
+			}
+			sleepSync(Math.min(wait, Math.max(0, deadline - Date.now())));
+			wait = Math.min(wait * 1.5, STORE_LOCK_MAX_WAIT_MS);
+		}
+	}
+
+	const heartbeat: ReturnType<typeof setInterval> = setInterval(
+		() => {
+			try {
+				const now = new Date();
+				fs.utimesSync(lockDir, now, now);
+			} catch {
+				/* the lock was reclaimed; the next write attempt will notice */
+			}
+		},
+		Math.max(1_000, Math.floor(staleMs / 3)),
+	);
+	// Node returns a Timeout with unref(); other runtimes may not. A pending
+	// heartbeat must not keep the process alive on its own.
+	(heartbeat as { unref?: () => void }).unref?.();
+
+	try {
+		return fn();
+	} finally {
+		clearInterval(heartbeat);
+		try {
+			fs.rmSync(lockDir, { recursive: true, force: true });
+		} catch {
+			/* already gone; age-based reclaim will clean up if not */
+		}
+	}
+}
+
+/**
+ * rename() that survives a lock-free reader holding the target open. The target
+ * is intact while this retries, which is what makes the retry the right move
+ * rather than a fallback to truncating in place.
+ */
+export function renameWithRetry(
+	tmp: string,
+	target: string,
+	budgetMs = STORE_RENAME_BUDGET_MS,
+	rename: (from: string, to: string) => void = fs.renameSync,
+): void {
+	const deadline = Date.now() + budgetMs;
+	for (;;) {
+		try {
+			rename(tmp, target);
+			return;
+		} catch (err) {
+			if (!isTransientShareError(err) || Date.now() >= deadline) throw err;
+			sleepSync(STORE_RENAME_RETRY_MS);
+		}
+	}
+}
+
+/**
+ * Replace target atomically: write a sibling temp file, then rename over the
+ * target. Readers either see the previous file or the new one.
+ */
+export function writeFileAtomic(target: string, content: string, budgetMs = STORE_RENAME_BUDGET_MS): void {
+	const tmp = `${target}.${process.pid.toString(36)}.${randomUUID().slice(0, 8)}.tmp`;
+	fs.writeFileSync(tmp, content, "utf-8");
+	try {
+		renameWithRetry(tmp, target, budgetMs);
+	} finally {
+		try {
+			fs.rmSync(tmp, { force: true });
+		} catch {
+			/* renamed away already */
+		}
+	}
+}
+
+/**
+ * Append entry to target under the store lock, re-reading inside the lock so a
+ * concurrent append from another process is preserved. Returns the content that
+ * was there before this call.
+ */
+export function appendToStore(target: string, entry: string, trailingNewline = false): string {
+	return withStoreLock(target, () => {
+		const existing = readFileSafe(target) ?? "";
+		const separator = existing.trim() ? "\n\n" : "";
+		const next = existing + separator + entry + (trailingNewline ? "\n" : "");
+		writeFileAtomic(target, next);
+		return existing;
+	});
+}
+
+/**
+ * Read-modify-write under the store lock. transform receives the content read
+ * *inside* the lock and returns the replacement plus an arbitrary result.
+ */
+export function updateStore<T>(target: string, transform: (existing: string) => { content: string; result: T }): T {
+	return withStoreLock(target, () => {
+		const existing = readFileSafe(target) ?? "";
+		const { content, result } = transform(existing);
+		writeFileAtomic(target, content);
+		return result;
+	});
+}
+
 const DAILY_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 
 export function isValidDailyDate(date: string): boolean {
@@ -1548,9 +1773,7 @@ export default function (pi: ExtensionAPI) {
 					const ts = nowTimestamp();
 					const entry = formatExitSummaryEntry(summary, reason, sid, ts);
 					const filePath = dailyPath(todayStr());
-					const existing = readFileSafe(filePath) ?? "";
-					const separator = existing.trim() ? "\n\n" : "";
-					fs.writeFileSync(filePath, existing + separator + entry, "utf-8");
+					appendToStore(filePath, entry);
 					await ensureQmdAvailableForUpdate();
 					await runQmdUpdateNow();
 				}
@@ -1672,9 +1895,7 @@ export default function (pi: ExtensionAPI) {
 			const handoff = [`<!-- HANDOFF ${ts} [${sid}] -->`, "## Session Handoff", ...parts].join("\n");
 
 			const filePath = dailyPath(todayStr());
-			const existing = readFileSafe(filePath) ?? "";
-			const separator = existing.trim() ? "\n\n" : "";
-			fs.writeFileSync(filePath, existing + separator + handoff, "utf-8");
+			appendToStore(filePath, handoff);
 			await ensureQmdAvailableForUpdate();
 			scheduleQmdUpdate();
 		} finally {
@@ -1712,19 +1933,26 @@ export default function (pi: ExtensionAPI) {
 
 			if (target === "daily") {
 				const filePath = dailyPath(todayStr());
-				const existing = readFileSafe(filePath) ?? "";
-				const existingPreview = buildPreview(existing, {
-					maxLines: RESPONSE_PREVIEW_MAX_LINES,
-					maxChars: RESPONSE_PREVIEW_MAX_CHARS,
-					mode: "end",
-				});
+				const stamped = `<!-- ${ts} [${sid}] -->\n${content}`;
+				// Read, merge and write under one lock. A concurrent append from
+				// another pi process has to be part of the copy this preview
+				// describes, otherwise the response quotes content it just
+				// clobbered.
+				const { existing, existingPreview } = updateStore(filePath, (current) => ({
+					content: current + (current.trim() ? "\n\n" : "") + stamped,
+					result: {
+						existing: current,
+						existingPreview: buildPreview(current, {
+							maxLines: RESPONSE_PREVIEW_MAX_LINES,
+							maxChars: RESPONSE_PREVIEW_MAX_CHARS,
+							mode: "end",
+						}),
+					},
+				}));
 				const existingSnippet = existingPreview.preview
 					? `\n\n${formatPreviewBlock("Existing daily log preview", existing, "end")}`
 					: "\n\nDaily log was empty.";
 
-				const separator = existing.trim() ? "\n\n" : "";
-				const stamped = `<!-- ${ts} [${sid}] -->\n${content}`;
-				fs.writeFileSync(filePath, existing + separator + stamped, "utf-8");
 				await ensureQmdAvailableForUpdate();
 				scheduleQmdUpdate();
 				return {
@@ -1765,7 +1993,10 @@ export default function (pi: ExtensionAPI) {
 
 			if (mode === "overwrite") {
 				const stamped = `<!-- last updated: ${ts} [${sid}] -->\n${content}`;
-				fs.writeFileSync(MEMORY_FILE, stamped, "utf-8");
+				// A deliberate full replace, so there is nothing to re-read: the
+				// lock only keeps a concurrent append from landing in the window
+				// between this write and the next one.
+				withStoreLock(MEMORY_FILE, () => writeFileAtomic(MEMORY_FILE, stamped));
 				await ensureQmdAvailableForUpdate();
 				scheduleQmdUpdate();
 				return {
@@ -1783,9 +2014,8 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// append (default)
-			const separator = existing.trim() ? "\n\n" : "";
 			const stamped = `<!-- ${ts} [${sid}] -->\n${content}`;
-			fs.writeFileSync(MEMORY_FILE, existing + separator + stamped, "utf-8");
+			appendToStore(MEMORY_FILE, stamped);
 			await ensureQmdAvailableForUpdate();
 			scheduleQmdUpdate();
 			return {
@@ -1869,13 +2099,17 @@ export default function (pi: ExtensionAPI) {
 						details: {},
 					};
 				}
-				const serialized = scratchpadAdd(existing, text, `<!-- ${ts} [${sid}] -->`);
+				// Re-read under the lock: `existing` above was taken without one, so
+				// an item another process added in between would be dropped here.
+				const serialized = updateStore(SCRATCHPAD_FILE, (current) => {
+					const next = scratchpadAdd(current, text, `<!-- ${ts} [${sid}] -->`);
+					return { content: next, result: next };
+				});
 				const preview = buildPreview(serialized, {
 					maxLines: RESPONSE_PREVIEW_MAX_LINES,
 					maxChars: RESPONSE_PREVIEW_MAX_CHARS,
 					mode: "start",
 				});
-				fs.writeFileSync(SCRATCHPAD_FILE, serialized, "utf-8");
 				await ensureQmdAvailableForUpdate();
 				scheduleQmdUpdate();
 				return {
@@ -1908,7 +2142,17 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 				const targetDone = action === "done";
-				const toggled = scratchpadToggle(existing, text, targetDone);
+				// Matching and writing under one lock, against a copy read inside it:
+				// toggling rewrites the whole file, so a stale read would silently
+				// drop whatever another process appended in the meantime.
+				const toggled = withStoreLock(SCRATCHPAD_FILE, () => {
+					const current = readFileSafe(SCRATCHPAD_FILE) ?? "";
+					const result = scratchpadToggle(current, text, targetDone);
+					// A miss must not rewrite the file; content is unchanged either
+					// way, but skipping the write keeps the read-only path read-only.
+					if (result.matched) writeFileAtomic(SCRATCHPAD_FILE, result.content);
+					return result;
+				});
 				if (!toggled.matched) {
 					return {
 						content: [
@@ -1926,7 +2170,6 @@ export default function (pi: ExtensionAPI) {
 					maxChars: RESPONSE_PREVIEW_MAX_CHARS,
 					mode: "start",
 				});
-				fs.writeFileSync(SCRATCHPAD_FILE, serialized, "utf-8");
 				await ensureQmdAvailableForUpdate();
 				scheduleQmdUpdate();
 				return {
@@ -1947,15 +2190,16 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (action === "clear_done") {
-				const cleared = scratchpadClearDone(existing);
-				const removed = cleared.removed;
-				const serialized = cleared.content;
+				const { removed, serialized } = withStoreLock(SCRATCHPAD_FILE, () => {
+					const cleared = scratchpadClearDone(readFileSafe(SCRATCHPAD_FILE) ?? "");
+					writeFileAtomic(SCRATCHPAD_FILE, cleared.content);
+					return { removed: cleared.removed, serialized: cleared.content };
+				});
 				const preview = buildPreview(serialized, {
 					maxLines: RESPONSE_PREVIEW_MAX_LINES,
 					maxChars: RESPONSE_PREVIEW_MAX_CHARS,
 					mode: "start",
 				});
-				fs.writeFileSync(SCRATCHPAD_FILE, serialized, "utf-8");
 				await ensureQmdAvailableForUpdate();
 				scheduleQmdUpdate();
 				return {
@@ -2145,26 +2389,36 @@ export default function (pi: ExtensionAPI) {
 				filePath = MEMORY_FILE;
 			}
 
-			const existing = readFileSafe(filePath);
-			if (!existing?.trim()) {
+			// Read, match, record and write under one lock. Re-reading inside the
+			// lock is the step that matters: forget rewrites the whole file from the
+			// copy it matched against, so a stale read silently drops whatever
+			// another process appended in the meantime.
+			const outcome = withStoreLock(filePath, () => {
+				const current = readFileSafe(filePath);
+				if (!current?.trim()) return { kind: "empty" as const };
+				const res = forgetBlocks(current, params.match);
+				if (res.removed.length === 0) return { kind: "nomatch" as const };
+				// Persist the complete recovery payload before mutating the source file.
+				// If either write fails, we never report a successful unrecoverable deletion.
+				const rec = writeRecoveryRecord(target, recoveryDate, res.removed);
+				writeFileAtomic(filePath, res.content);
+				return { kind: "ok" as const, recovery: rec, removed: res.removed };
+			});
+
+			if (outcome.kind === "empty") {
 				return {
 					content: [{ type: "text", text: `Nothing stored in ${filePath} — nothing to forget.` }],
 					details: { path: filePath, removed: 0 },
 				};
 			}
-
-			const result = forgetBlocks(existing, params.match);
-			if (result.removed.length === 0) {
+			if (outcome.kind === "nomatch") {
 				return {
 					content: [{ type: "text", text: `No entries matching "${params.match}" in ${filePath}.` }],
 					details: { path: filePath, removed: 0 },
 				};
 			}
-
-			// Persist the complete recovery payload before mutating the source file.
-			// If either write fails, we never report a successful unrecoverable deletion.
-			const recovery = writeRecoveryRecord(target, recoveryDate, result.removed);
-			fs.writeFileSync(filePath, result.content, "utf-8");
+			const recovery = outcome.recovery;
+			const removed = outcome.removed;
 			// Forget is a privacy-sensitive mutation. Refresh the snapshot immediately
 			// so deleted content disappears from authoritative context without being
 			// copied into persisted correction messages. This intentionally spends one
@@ -2173,7 +2427,7 @@ export default function (pi: ExtensionAPI) {
 			await ensureQmdAvailableForUpdate();
 			scheduleQmdUpdate();
 
-			const removedPreview = buildPreview(result.removed.join("\n\n"), {
+			const removedPreview = buildPreview(removed.join("\n\n"), {
 				maxLines: RESPONSE_PREVIEW_MAX_LINES,
 				maxChars: RESPONSE_PREVIEW_MAX_CHARS,
 				mode: "start",
@@ -2183,7 +2437,7 @@ export default function (pi: ExtensionAPI) {
 					{
 						type: "text",
 						text:
-							`Removed ${result.removed.length} entr${result.removed.length === 1 ? "y" : "ies"} from ${filePath}. ` +
+							`Removed ${removed.length} entr${removed.length === 1 ? "y" : "ies"} from ${filePath}. ` +
 							`Recovery ID: ${recovery.id}. To undo this deletion, call memory_restore with that ID.\n\n` +
 							"Removed content preview:\n\n" +
 							removedPreview.preview,
@@ -2192,7 +2446,7 @@ export default function (pi: ExtensionAPI) {
 				details: {
 					path: filePath,
 					target,
-					removed: result.removed.length,
+					removed: removed.length,
 					recoveryId: recovery.id,
 					recoveryPath: recoveryPath(recovery.id),
 					removedPreview,
@@ -2232,11 +2486,18 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const targetPath = record.target === "daily" ? dailyPath(record.date as string) : MEMORY_FILE;
-			const existing = readFileSafe(targetPath) ?? "";
-			const missingEntries = record.removedContent.filter((entry) => !existing.includes(entry));
+			// The membership test and the append have to look at the same content, so
+			// both run inside the lock; a concurrent write cannot slip between them.
+			const missingEntries = withStoreLock(targetPath, () => {
+				const current = readFileSafe(targetPath) ?? "";
+				const missing = record.removedContent.filter((entry) => !current.includes(entry));
+				if (missing.length > 0) {
+					const separator = current.trim() ? "\n\n" : "";
+					writeFileAtomic(targetPath, `${current}${separator}${missing.join("\n\n")}\n`);
+				}
+				return missing;
+			});
 			if (missingEntries.length > 0) {
-				const separator = existing.trim() ? "\n\n" : "";
-				fs.writeFileSync(targetPath, `${existing}${separator}${missingEntries.join("\n\n")}\n`, "utf-8");
 				// Restore changes which durable facts are authoritative, so refresh the
 				// snapshot instead of persisting restored content in a correction message.
 				refreshMemorySnapshot("memory_restore");
@@ -2245,7 +2506,9 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			record.restoredAt = new Date().toISOString();
-			fs.writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`, "utf-8");
+			// Atomic replace without a lock: the record is keyed by recovery id and
+			// only a restore of that same id writes it.
+			writeFileAtomic(recordPath, `${JSON.stringify(record, null, 2)}\n`);
 			return {
 				content: [
 					{
