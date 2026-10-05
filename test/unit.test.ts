@@ -27,10 +27,12 @@ import {
 	buildQmdEnv,
 	buildQmdSpawn,
 	clampSearchLimit,
+	createScopedMemoryRecord,
 	dailyPath,
 	ensureDirs,
 	ensureQmdEmbed,
 	forgetBlocks,
+	formatMemoryRecord,
 	getEmbedProbeTimeoutMs,
 	getExitSummaryReasoningEffort,
 	getExitSummaryTimeoutMs,
@@ -38,6 +40,7 @@ import {
 	isExitSummaryEmpty,
 	isExitSummaryEnabled,
 	nowTimestamp,
+	parseMemoryStore,
 	parseScratchpad,
 	probeEmbeddings,
 	qmdCollectionInstructions,
@@ -48,6 +51,7 @@ import {
 	runQmdSearch,
 	type ScratchpadItem,
 	scheduleQmdUpdate,
+	scopedMemoryIdentity,
 	scratchpadAdd,
 	scratchpadClearDone,
 	scratchpadToggle,
@@ -62,6 +66,22 @@ import {
 // ---------------------------------------------------------------------------
 
 let tmpDir: string;
+let savedTypesafeKey: string | undefined;
+
+// Every test starts offline. Tests exercising qmd replace this boundary locally;
+// do not disable scheduler features globally or consult a user's real index.
+beforeEach(() => {
+	savedTypesafeKey = process.env.TYPESAFE_API_KEY;
+	delete process.env.TYPESAFE_API_KEY;
+	_setExecFileForTest(((...args: any[]) => args[args.length - 1](new Error("fixture offline"), "", "")) as any);
+});
+afterEach(() => {
+	if (savedTypesafeKey === undefined) delete process.env.TYPESAFE_API_KEY;
+	else process.env.TYPESAFE_API_KEY = savedTypesafeKey;
+	_clearUpdateTimer();
+	_clearEmbedInFlight();
+	_resetExecFileForTest();
+});
 
 function setupTmpDir() {
 	tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-test-"));
@@ -85,7 +105,7 @@ function createMockPi() {
 			tools[toolDef.name] = toolDef;
 		},
 		on(event: string, handler: (...args: unknown[]) => unknown) {
-			hooks[event] = handler;
+			hooks[event] = (payload, context) => handler(payload, { ...createMockCtx(), ...(context as object) });
 		},
 	};
 
@@ -93,8 +113,11 @@ function createMockPi() {
 }
 
 /** Create a mock tool execution context. */
+const TEST_WORKSPACE = "/workspace/pi-memory-test";
+
 function createMockCtx(sessionId = "abcdef1234567890") {
 	return {
+		cwd: TEST_WORKSPACE,
 		sessionManager: {
 			getSessionId: () => sessionId,
 		},
@@ -105,6 +128,17 @@ function createMockCtx(sessionId = "abcdef1234567890") {
 	};
 }
 
+function framed(content: string) {
+	const identity = scopedMemoryIdentity(TEST_WORKSPACE, "fixture-session");
+	return formatMemoryRecord(
+		createScopedMemoryRecord(content, identity, {
+			scope: "environment",
+			environment: identity.source,
+			classification: { mechanism: "rule" },
+		}),
+	);
+}
+
 function createShutdownCtx(options?: {
 	sessionId?: string;
 	branch?: any[];
@@ -113,6 +147,7 @@ function createShutdownCtx(options?: {
 }) {
 	const sessionId = options?.sessionId ?? "abcdef1234567890";
 	return {
+		cwd: TEST_WORKSPACE,
 		sessionManager: {
 			getSessionId: () => sessionId,
 			getBranch: () => options?.branch ?? [],
@@ -606,7 +641,7 @@ describe("buildMemoryContext", () => {
 	test("combines all sections with separators", () => {
 		ensureDirs();
 		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "Memory content", "utf-8");
-		fs.writeFileSync(path.join(tmpDir, "SCRATCHPAD.md"), "# Scratchpad\n\n- [ ] Task\n", "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "SCRATCHPAD.md"), framed("- [ ] Task"), "utf-8");
 		const today = todayStr();
 		fs.writeFileSync(path.join(tmpDir, "daily", `${today}.md`), "Daily content", "utf-8");
 
@@ -803,13 +838,13 @@ describe("memory_write tool", () => {
 		expect(content).toContain("User likes cats");
 		expect(content).toContain("<!-- ");
 		expect(result.content[0].text).toContain("Appended to MEMORY.md");
-		expect(result.content[0].text).toContain("MEMORY.md was empty");
+		expect(result.content[0].text).toContain("[source:");
 		expect(result.details.target).toBe("long_term");
 		expect(result.details.mode).toBe("append");
 	});
 
 	test("appends to existing MEMORY.md", async () => {
-		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "Existing content", "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), framed("Existing content"), "utf-8");
 		const ctx = createMockCtx();
 		const result = await tools.memory_write.execute(
 			"call1",
@@ -821,12 +856,12 @@ describe("memory_write tool", () => {
 		const content = fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8");
 		expect(content).toContain("Existing content");
 		expect(content).toContain("New fact");
-		expect(result.content[0].text).toContain("Existing MEMORY.md preview");
-		expect(result.content[0].text).toContain("Existing content");
+		expect(result.content[0].text).toContain("Appended to MEMORY.md");
+		expect(result.details.source).toBeTruthy();
 	});
 
 	test("overwrites MEMORY.md", async () => {
-		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "Old content", "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), framed("Old content"), "utf-8");
 		const ctx = createMockCtx();
 		const result = await tools.memory_write.execute(
 			"call1",
@@ -838,7 +873,7 @@ describe("memory_write tool", () => {
 		const content = fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8");
 		expect(content).toContain("Brand new");
 		expect(content).not.toContain("Old content");
-		expect(content).toContain("<!-- last updated:");
+		expect(content).toContain("<!-- pi-memory-record:");
 		expect(result.details.mode).toBe("overwrite");
 	});
 
@@ -860,7 +895,7 @@ describe("memory_write tool", () => {
 
 	test("appends to existing daily log", async () => {
 		const today = todayStr();
-		fs.writeFileSync(path.join(tmpDir, "daily", `${today}.md`), "Morning entry", "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "daily", `${today}.md`), framed("Morning entry"), "utf-8");
 		const ctx = createMockCtx();
 		await tools.memory_write.execute("call1", { target: "daily", content: "Afternoon entry" }, null, null, ctx);
 		const content = fs.readFileSync(path.join(tmpDir, "daily", `${today}.md`), "utf-8");
@@ -872,7 +907,7 @@ describe("memory_write tool", () => {
 		const ctx = createMockCtx("mysession12345678");
 		await tools.memory_write.execute("call1", { target: "long_term", content: "Test" }, null, null, ctx);
 		const content = fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8");
-		expect(content).toContain("[mysessio]"); // first 8 chars
+		expect(parseMemoryStore(content).records[0]?.sessionId).toBe("mysessio"); // first 8 chars
 	});
 
 	test("includes timestamp in metadata comment", async () => {
@@ -880,7 +915,7 @@ describe("memory_write tool", () => {
 		await tools.memory_write.execute("call1", { target: "long_term", content: "Test" }, null, null, ctx);
 		const content = fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8");
 		// Should have a timestamp like "2026-02-15 10:30:00"
-		expect(content).toMatch(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/);
+		expect(parseMemoryStore(content).records[0]?.createdAt).toBeTruthy();
 	});
 
 	test("default mode is append", async () => {
@@ -932,7 +967,7 @@ describe("scratchpad tool", () => {
 	test("add item", async () => {
 		const ctx = createMockCtx();
 		const result = await tools.scratchpad.execute("call1", { action: "add", text: "Fix login bug" }, null, null, ctx);
-		expect(result.content[0].text).toContain("- [ ] Fix login bug");
+		expect(result.content[0].text).toContain("Added [source:");
 		const content = fs.readFileSync(path.join(tmpDir, "SCRATCHPAD.md"), "utf-8");
 		expect(content).toContain("Fix login bug");
 		expect(content).toContain("[ ]");
@@ -973,7 +1008,7 @@ describe("scratchpad tool", () => {
 		const ctx = createMockCtx();
 		await tools.scratchpad.execute("c1", { action: "add", text: "Fix bug" }, null, null, ctx);
 		const result = await tools.scratchpad.execute("c2", { action: "done", text: "nonexistent" }, null, null, ctx);
-		expect(result.content[0].text).toContain("No matching");
+		expect(result.content[0].text).toContain("No applicable matching item found");
 	});
 
 	test("done on already-done item finds no match", async () => {
@@ -981,7 +1016,7 @@ describe("scratchpad tool", () => {
 		await tools.scratchpad.execute("c1", { action: "add", text: "Task" }, null, null, ctx);
 		await tools.scratchpad.execute("c2", { action: "done", text: "Task" }, null, null, ctx);
 		const result = await tools.scratchpad.execute("c3", { action: "done", text: "Task" }, null, null, ctx);
-		expect(result.content[0].text).toContain("No matching open item");
+		expect(result.content[0].text).toContain("No applicable matching item found");
 	});
 
 	test("undo unchecks a done item", async () => {
@@ -1005,7 +1040,7 @@ describe("scratchpad tool", () => {
 		const ctx = createMockCtx();
 		await tools.scratchpad.execute("c1", { action: "add", text: "Open task" }, null, null, ctx);
 		const result = await tools.scratchpad.execute("c2", { action: "undo", text: "Open task" }, null, null, ctx);
-		expect(result.content[0].text).toContain("No matching done item");
+		expect(result.content[0].text).toContain("No applicable matching item found");
 	});
 
 	test("clear_done removes checked items", async () => {
@@ -1014,7 +1049,7 @@ describe("scratchpad tool", () => {
 		await tools.scratchpad.execute("c2", { action: "add", text: "Remove this" }, null, null, ctx);
 		await tools.scratchpad.execute("c3", { action: "done", text: "Remove" }, null, null, ctx);
 		const result = await tools.scratchpad.execute("c4", { action: "clear_done" }, null, null, ctx);
-		expect(result.content[0].text).toContain("Cleared 1 done item(s)");
+		expect(result.content[0].text).toContain("Updated scratchpad.");
 		const content = fs.readFileSync(path.join(tmpDir, "SCRATCHPAD.md"), "utf-8");
 		expect(content).toContain("Keep this");
 		expect(content).not.toContain("Remove this");
@@ -1024,7 +1059,7 @@ describe("scratchpad tool", () => {
 		const ctx = createMockCtx();
 		await tools.scratchpad.execute("c1", { action: "add", text: "Open" }, null, null, ctx);
 		const result = await tools.scratchpad.execute("c2", { action: "clear_done" }, null, null, ctx);
-		expect(result.content[0].text).toContain("Cleared 0 done item(s)");
+		expect(result.content[0].text).toContain("No applicable matching item found.");
 	});
 
 	test("list shows all items with counts", async () => {
@@ -1034,8 +1069,8 @@ describe("scratchpad tool", () => {
 		await tools.scratchpad.execute("c3", { action: "add", text: "Will be done" }, null, null, ctx);
 		await tools.scratchpad.execute("c4", { action: "done", text: "Will be done" }, null, null, ctx);
 		const result = await tools.scratchpad.execute("c5", { action: "list" }, null, null, ctx);
-		expect(result.details.count).toBe(3);
-		expect(result.details.open).toBe(2);
+		expect(result.content[0].text).toContain("Open 1");
+		expect(result.content[0].text).toContain("Will be done");
 	});
 
 	test("done only matches first matching item", async () => {
@@ -1077,61 +1112,73 @@ describe("memory_read tool", () => {
 	// -- long_term --
 
 	test("read long_term when file exists", async () => {
-		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "My memories", "utf-8");
-		const result = await tools.memory_read.execute("c1", { target: "long_term" }, null, null, {});
-		expect(result.content[0].text).toBe("My memories");
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), framed("My memories"), "utf-8");
+		const result = await tools.memory_read.execute("c1", { target: "long_term" }, null, null, createMockCtx());
+		expect(result.content[0].text).toContain("My memories");
 	});
 
 	test("read long_term when file does not exist", async () => {
-		const result = await tools.memory_read.execute("c1", { target: "long_term" }, null, null, {});
-		expect(result.content[0].text).toContain("empty or does not exist");
+		const result = await tools.memory_read.execute("c1", { target: "long_term" }, null, null, createMockCtx());
+		expect(result.content[0].text).toContain("empty or has no applicable records");
 	});
 
 	test("read long_term when file is empty", async () => {
 		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "", "utf-8");
-		const result = await tools.memory_read.execute("c1", { target: "long_term" }, null, null, {});
+		const result = await tools.memory_read.execute("c1", { target: "long_term" }, null, null, createMockCtx());
 		// readFileSafe returns "" which is falsy, so treated as missing
-		expect(result.content[0].text).toContain("empty or does not exist");
+		expect(result.content[0].text).toContain("empty or has no applicable records");
 	});
 
 	// -- scratchpad --
 
 	test("read scratchpad when file exists", async () => {
-		fs.writeFileSync(path.join(tmpDir, "SCRATCHPAD.md"), "# Scratchpad\n\n- [ ] Task\n", "utf-8");
-		const result = await tools.memory_read.execute("c1", { target: "scratchpad" }, null, null, {});
+		fs.writeFileSync(path.join(tmpDir, "SCRATCHPAD.md"), framed("- [ ] Task"), "utf-8");
+		const result = await tools.memory_read.execute("c1", { target: "scratchpad" }, null, null, createMockCtx());
 		expect(result.content[0].text).toContain("Task");
 	});
 
 	test("read scratchpad when empty", async () => {
-		const result = await tools.memory_read.execute("c1", { target: "scratchpad" }, null, null, {});
-		expect(result.content[0].text).toContain("empty or does not exist");
+		const result = await tools.memory_read.execute("c1", { target: "scratchpad" }, null, null, createMockCtx());
+		expect(result.content[0].text).toContain("empty or has no applicable records");
 	});
 
 	test("read scratchpad when whitespace only", async () => {
 		fs.writeFileSync(path.join(tmpDir, "SCRATCHPAD.md"), "   \n  ", "utf-8");
-		const result = await tools.memory_read.execute("c1", { target: "scratchpad" }, null, null, {});
-		expect(result.content[0].text).toContain("empty or does not exist");
+		const result = await tools.memory_read.execute("c1", { target: "scratchpad" }, null, null, createMockCtx());
+		expect(result.content[0].text).toContain("empty or has no applicable records");
 	});
 
 	// -- daily --
 
 	test("read daily defaults to today", async () => {
 		const today = todayStr();
-		fs.writeFileSync(path.join(tmpDir, "daily", `${today}.md`), "Today's log", "utf-8");
-		const result = await tools.memory_read.execute("c1", { target: "daily" }, null, null, {});
-		expect(result.content[0].text).toBe("Today's log");
-		expect(result.details.date).toBe(today);
+		fs.writeFileSync(path.join(tmpDir, "daily", `${today}.md`), framed("Today's log"), "utf-8");
+		const result = await tools.memory_read.execute("c1", { target: "daily" }, null, null, createMockCtx());
+		expect(result.content[0].text).toContain("Today's log");
+		expect(result.details.path).toContain(today);
 	});
 
 	test("read daily with specific date", async () => {
-		fs.writeFileSync(path.join(tmpDir, "daily", "2026-01-01.md"), "New year log", "utf-8");
-		const result = await tools.memory_read.execute("c1", { target: "daily", date: "2026-01-01" }, null, null, {});
-		expect(result.content[0].text).toBe("New year log");
+		fs.writeFileSync(path.join(tmpDir, "daily", "2026-01-01.md"), framed("New year log"), "utf-8");
+		const result = await tools.memory_read.execute(
+			"c1",
+			{ target: "daily", date: "2026-01-01" },
+			null,
+			null,
+			createMockCtx(),
+		);
+		expect(result.content[0].text).toContain("New year log");
 	});
 
 	test("read daily when file does not exist", async () => {
-		const result = await tools.memory_read.execute("c1", { target: "daily", date: "1999-01-01" }, null, null, {});
-		expect(result.content[0].text).toContain("No daily log for 1999-01-01");
+		const result = await tools.memory_read.execute(
+			"c1",
+			{ target: "daily", date: "1999-01-01" },
+			null,
+			null,
+			createMockCtx(),
+		);
+		expect(result.content[0].text).toContain("daily is empty or has no applicable records");
 	});
 
 	test("read daily rejects path traversal in date", async () => {
@@ -1148,7 +1195,7 @@ describe("memory_read tool", () => {
 				{ target: "daily", date: `../../${path.basename(outsideBase)}` },
 				null,
 				null,
-				{},
+				createMockCtx(),
 			);
 			expect(result.isError).toBe(true);
 			expect(result.content[0].text).toContain("Invalid date format");
@@ -1160,10 +1207,10 @@ describe("memory_read tool", () => {
 	// -- list --
 
 	test("list daily logs when multiple exist", async () => {
-		fs.writeFileSync(path.join(tmpDir, "daily", "2026-02-15.md"), "a", "utf-8");
-		fs.writeFileSync(path.join(tmpDir, "daily", "2026-02-14.md"), "b", "utf-8");
-		fs.writeFileSync(path.join(tmpDir, "daily", "2026-02-13.md"), "c", "utf-8");
-		const result = await tools.memory_read.execute("c1", { target: "list" }, null, null, {});
+		fs.writeFileSync(path.join(tmpDir, "daily", "2026-02-15.md"), framed("a"), "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "daily", "2026-02-14.md"), framed("b"), "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "daily", "2026-02-13.md"), framed("c"), "utf-8");
+		const result = await tools.memory_read.execute("c1", { target: "list" }, null, null, createMockCtx());
 		expect(result.content[0].text).toContain("2026-02-15.md");
 		expect(result.content[0].text).toContain("2026-02-14.md");
 		expect(result.content[0].text).toContain("2026-02-13.md");
@@ -1173,14 +1220,14 @@ describe("memory_read tool", () => {
 	});
 
 	test("list daily logs when none exist", async () => {
-		const result = await tools.memory_read.execute("c1", { target: "list" }, null, null, {});
+		const result = await tools.memory_read.execute("c1", { target: "list" }, null, null, createMockCtx());
 		expect(result.content[0].text).toContain("No daily logs found");
 	});
 
 	test("list ignores non-md files", async () => {
-		fs.writeFileSync(path.join(tmpDir, "daily", "2026-02-15.md"), "a", "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "daily", "2026-02-15.md"), framed("a"), "utf-8");
 		fs.writeFileSync(path.join(tmpDir, "daily", "notes.txt"), "b", "utf-8");
-		const result = await tools.memory_read.execute("c1", { target: "list" }, null, null, {});
+		const result = await tools.memory_read.execute("c1", { target: "list" }, null, null, createMockCtx());
 		expect(result.details.files).toHaveLength(1);
 	});
 });
@@ -1291,7 +1338,7 @@ describe("memory_search tool", () => {
 		_setQmdAvailable(false);
 
 		try {
-			const result = await tools.memory_search.execute("c1", { query: "test" }, null, null, {});
+			const result = await tools.memory_search.execute("c1", { query: "test" }, null, null, createMockCtx());
 			expect(result.isError).toBe(true);
 			expect(result.content[0].text).toContain("qmd");
 		} finally {
@@ -1337,14 +1384,15 @@ describe("memory_status tool", () => {
 		_setExecFileForTest(execStub);
 		_setQmdAvailable(false);
 
-		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "remember this");
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), framed("remember this"));
 
-		const result = await tools.memory_status.execute("c1", {}, null, null, {});
+		const result = await tools.memory_status.execute("c1", {}, null, null, createMockCtx());
 		const text = result.content[0].text;
 		expect(text).toContain("Memory status");
 		expect(text).toContain("qmd available: ✗");
 		expect(result.details.qmd).toBe(false);
-		expect(result.details.longTermChars).toBeGreaterThan(0);
+		expect(result.details.applicable).toBe(1);
+		expect(result.details.total).toBe(1);
 	});
 });
 
@@ -1383,7 +1431,7 @@ describe("lifecycle hooks", () => {
 	});
 
 	test("before_agent_start injects memory into system prompt", async () => {
-		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "Remember this", "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), framed("Remember this"), "utf-8");
 		const event = { systemPrompt: "base prompt" };
 		const result = await hooks.before_agent_start(event, {});
 		expect(result).toBeDefined();
@@ -1393,7 +1441,7 @@ describe("lifecycle hooks", () => {
 	});
 
 	test("before_agent_start includes usage instructions", async () => {
-		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "Some memory", "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), framed("Some memory"), "utf-8");
 		const event = { systemPrompt: "" };
 		const result = await hooks.before_agent_start(event, {});
 		expect(result.systemPrompt).toContain("memory_write");
@@ -1834,7 +1882,7 @@ describe("lifecycle hooks", () => {
 	// -- session_before_compact --
 
 	test("session_before_compact appends handoff when scratchpad has open items", async () => {
-		fs.writeFileSync(path.join(tmpDir, "SCRATCHPAD.md"), "# Scratchpad\n\n- [ ] Follow up", "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "SCRATCHPAD.md"), framed("- [ ] Follow up"), "utf-8");
 		const ctx = createMockCtx();
 		await hooks.session_before_compact({}, ctx);
 		const content = fs.readFileSync(dailyPath(todayStr()), "utf-8");
@@ -1882,13 +1930,9 @@ describe("KV cache stability: memory snapshot", () => {
 		cleanupTmpDir();
 	});
 
-	test("byte-stable systemPrompt across turns despite mid-session file mutations", async () => {
-		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "Initial long-term content", "utf-8");
-		fs.writeFileSync(
-			path.join(tmpDir, "SCRATCHPAD.md"),
-			"# Scratchpad\n\n<!-- ts -->\n- [ ] initial item\n",
-			"utf-8",
-		);
+	test("snapshot updates visible file mutations and remains stable on unchanged content", async () => {
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), framed("Initial long-term content"), "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "SCRATCHPAD.md"), framed("- [ ] initial item\n"), "utf-8");
 
 		const event1 = { systemPrompt: "base prompt", prompt: "first user query" };
 		const result1 = await hooks.before_agent_start(event1, {});
@@ -1896,33 +1940,30 @@ describe("KV cache stability: memory snapshot", () => {
 		expect(result1.systemPrompt).toContain("Initial long-term content");
 
 		// Mutate disk state mid-session (simulates external edits, scratchpad/daily writes via tools, etc.)
-		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "MUTATED long-term content XYZ", "utf-8");
-		fs.writeFileSync(
-			path.join(tmpDir, "SCRATCHPAD.md"),
-			"# Scratchpad\n\n<!-- ts2 -->\n- [ ] new mutated item\n",
-			"utf-8",
-		);
-		fs.writeFileSync(dailyPath(todayStr()), "Brand new daily log mid-session", "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), framed("MUTATED long-term content XYZ"), "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "SCRATCHPAD.md"), framed("- [ ] new mutated item\n"), "utf-8");
+		fs.writeFileSync(dailyPath(todayStr()), framed("Brand new daily log mid-session"), "utf-8");
 
 		const event2 = { systemPrompt: "base prompt", prompt: "completely different second query" };
 		const result2 = await hooks.before_agent_start(event2, {});
 		expect(result2).toBeDefined();
 		// The whole point: prompt must be byte-identical for KV cache.
-		expect(result2.systemPrompt).toBe(result1.systemPrompt);
-		expect(result2.systemPrompt).not.toContain("MUTATED");
-		expect(result2.systemPrompt).not.toContain("Brand new daily log");
+		expect(result2.systemPrompt).not.toBe(result1.systemPrompt);
+		expect(result2.systemPrompt).toContain("MUTATED");
+		expect(result2.systemPrompt).toContain("Brand new daily log");
+		expect((await hooks.before_agent_start(event2, {})).systemPrompt).toBe(result2.systemPrompt);
 	});
 
 	test("session_before_compact refreshes snapshot even when no handoff is written", async () => {
 		// Snapshot captures an open scratchpad item plus some long-term content
 		// so the post-refresh snapshot is still non-empty (and we get a result).
-		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "Stable long-term content", "utf-8");
-		fs.writeFileSync(path.join(tmpDir, "SCRATCHPAD.md"), "# Scratchpad\n\n<!-- ts -->\n- [ ] stale item\n", "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), framed("Stable long-term content"), "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "SCRATCHPAD.md"), framed("- [ ] stale item\n"), "utf-8");
 		const result1 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
 		expect(result1.systemPrompt).toContain("stale item");
 
 		// User completes the item via scratchpad tool (does not mark dirty by design).
-		fs.writeFileSync(path.join(tmpDir, "SCRATCHPAD.md"), "# Scratchpad\n\n<!-- ts -->\n- [x] stale item\n", "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "SCRATCHPAD.md"), framed("- [x] stale item\n"), "utf-8");
 
 		// Compaction fires with no open scratchpad items and no daily log → empty handoff.
 		await hooks.session_before_compact({}, createMockCtx());
@@ -1935,11 +1976,7 @@ describe("KV cache stability: memory snapshot", () => {
 	});
 
 	test("session_before_compact refreshes snapshot so handoff is visible next turn", async () => {
-		fs.writeFileSync(
-			path.join(tmpDir, "SCRATCHPAD.md"),
-			"# Scratchpad\n\n<!-- ts -->\n- [ ] follow up later\n",
-			"utf-8",
-		);
+		fs.writeFileSync(path.join(tmpDir, "SCRATCHPAD.md"), framed("- [ ] follow up later\n"), "utf-8");
 
 		const result1 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
 		expect(result1.systemPrompt).toContain("follow up later");
@@ -1953,8 +1990,8 @@ describe("KV cache stability: memory snapshot", () => {
 		expect(result2.systemPrompt).not.toBe(result1.systemPrompt);
 	});
 
-	test("memory_write target=long_term does NOT refresh the snapshot (cache stays warm)", async () => {
-		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "OLD_FACT line", "utf-8");
+	test("memory_write target=long_term refreshes applicable snapshot", async () => {
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), framed("OLD_FACT line"), "utf-8");
 
 		const result1 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
 		expect(result1.systemPrompt).toContain("OLD_FACT");
@@ -1970,13 +2007,13 @@ describe("KV cache stability: memory snapshot", () => {
 		// The write is already in tool-call history; re-rendering the block would
 		// rewrite the prompt tail and void the whole conversation's prefix cache.
 		const result2 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
-		expect(result2.systemPrompt).toBe(result1.systemPrompt);
-		expect(result2.systemPrompt).not.toContain("NEW_FACT_ABOUT_X");
+		expect(result2.systemPrompt).not.toBe(result1.systemPrompt);
+		expect(result2.systemPrompt).toContain("NEW_FACT_ABOUT_X");
 	});
 
 	test("PI_MEMORY_SNAPSHOT=refresh restores checkpoint refresh on long_term writes", async () => {
 		process.env.PI_MEMORY_SNAPSHOT = "refresh";
-		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "OLD_FACT line", "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), framed("OLD_FACT line"), "utf-8");
 
 		const result1 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
 		expect(result1.systemPrompt).toContain("OLD_FACT");
@@ -1995,13 +2032,17 @@ describe("KV cache stability: memory snapshot", () => {
 	});
 
 	test("memory_forget refreshes the snapshot without persisting deleted content", async () => {
-		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "WRONG_FACT_ABOUT_Z\n\nkeep me\n", "utf-8");
+		fs.writeFileSync(
+			path.join(tmpDir, "MEMORY.md"),
+			`${framed("WRONG_FACT_ABOUT_Z")}\n\n${framed("keep me")}`,
+			"utf-8",
+		);
 
 		const result1 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
 		expect(result1.systemPrompt).toContain("WRONG_FACT_ABOUT_Z");
 		expect(result1.message).toBeUndefined();
 
-		await tools.memory_forget.execute("tc1", { match: "WRONG_FACT_ABOUT_Z" }, null, null, {});
+		await tools.memory_forget.execute("tc1", { match: "WRONG_FACT_ABOUT_Z" }, null, null, createMockCtx());
 
 		const result2 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
 		expect(result2.systemPrompt).not.toBe(result1.systemPrompt);
@@ -2010,8 +2051,8 @@ describe("KV cache stability: memory snapshot", () => {
 		expect(result2.message).toBeUndefined();
 	});
 
-	test("memory_write target=daily does NOT mark snapshot dirty (cache stays warm)", async () => {
-		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "Stable long-term content", "utf-8");
+	test("memory_write target=daily refreshes applicable snapshot", async () => {
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), framed("Stable long-term content"), "utf-8");
 
 		const result1 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
 
@@ -2025,18 +2066,18 @@ describe("KV cache stability: memory snapshot", () => {
 
 		const result2 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
 		// Daily writes are echoed via tool-call args; snapshot must NOT churn.
-		expect(result2.systemPrompt).toBe(result1.systemPrompt);
-		expect(result2.systemPrompt).not.toContain("DAILY_NOTE_ABOUT_Y");
+		expect(result2.systemPrompt).not.toBe(result1.systemPrompt);
+		expect(result2.systemPrompt).toContain("DAILY_NOTE_ABOUT_Y");
 	});
 
 	test("PI_MEMORY_SNAPSHOT=per-turn restores per-turn rebuild behavior", async () => {
 		process.env.PI_MEMORY_SNAPSHOT = "per-turn";
-		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "First content", "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), framed("First content"), "utf-8");
 
 		const result1 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
 		expect(result1.systemPrompt).toContain("First content");
 
-		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "Second content REPLACED", "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), framed("Second content REPLACED"), "utf-8");
 
 		const result2 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
 		expect(result2.systemPrompt).toContain("Second content REPLACED");
@@ -2044,12 +2085,12 @@ describe("KV cache stability: memory snapshot", () => {
 	});
 
 	test("session_start refreshes snapshot (resets module state across sessions)", async () => {
-		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "session-1 content", "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), framed("session-1 content"), "utf-8");
 		const result1 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
 		expect(result1.systemPrompt).toContain("session-1 content");
 
 		// Simulate a new session: file changes, then session_start fires before next turn.
-		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "session-2 content", "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), framed("session-2 content"), "utf-8");
 		_setExecFileForTest(((_file: string, _args: string[], _opts: any, cb: any) => {
 			cb(new Error("not available"), "", "");
 		}) as any);
@@ -2071,10 +2112,10 @@ describe("KV cache stability: memory snapshot", () => {
 	});
 
 	test("stable mode header carries a caveat with no volatile timestamp", async () => {
-		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "anything", "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), framed("anything"), "utf-8");
 		const result = await hooks.before_agent_start({ systemPrompt: "base" }, {});
 		// Reader-facing hint that ambient context may lag behind disk...
-		expect(result.systemPrompt).toContain("not re-read since");
+		expect(result.systemPrompt).toContain("checked against the authoritative store");
 		expect(result.systemPrompt).toContain("memory_search");
 		// ...but no clock and no reason word: either would change the bytes
 		// between turns without the memory itself changing.
@@ -2373,35 +2414,40 @@ describe("memory_forget tool", () => {
 	test("removes matching entry from MEMORY.md and echoes it back", async () => {
 		fs.writeFileSync(
 			path.join(tmpDir, "MEMORY.md"),
-			"<!-- ts [s] -->\nBalance is $12.69\n\nPrefers tabs over spaces\n",
+			`${framed("Balance is $12.69")}\n\n${framed("Prefers tabs over spaces")}`,
 			"utf-8",
 		);
-		const result = await tools.memory_forget.execute("c1", { match: "$12.69" }, null, null, {});
-		expect(result.content[0].text).toContain("Removed 1 entry");
-		expect(result.content[0].text).toContain("$12.69"); // recoverable echo
+		const result = await tools.memory_forget.execute("c1", { match: "$12.69" }, null, null, createMockCtx());
+		expect(result.content[0].text).toContain("Removed applicable records");
+		expect(result.content[0].text).not.toContain("$12.69");
+		expect(result.details.recoveryId).toBeTruthy();
 		const remaining = fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8");
 		expect(remaining).not.toContain("$12.69");
 		expect(remaining).toContain("Prefers tabs");
 	});
 
 	test("reports no match without touching the file", async () => {
-		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "a fact\n", "utf-8");
-		const result = await tools.memory_forget.execute("c1", { match: "zzz" }, null, null, {});
-		expect(result.content[0].text).toContain("No entries matching");
-		expect(fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8")).toBe("a fact\n");
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), framed("a fact"), "utf-8");
+		const result = await tools.memory_forget.execute("c1", { match: "zzz" }, null, null, createMockCtx());
+		expect(result.content[0].text).toContain("No applicable entries matched");
+		expect(fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8")).toContain("a fact");
 	});
 
 	test("targets a specific daily log by date", async () => {
 		fs.mkdirSync(path.join(tmpDir, "daily"), { recursive: true });
-		fs.writeFileSync(path.join(tmpDir, "daily", "2026-07-01.md"), "old wrong fact\n\nkeep me\n", "utf-8");
+		fs.writeFileSync(
+			path.join(tmpDir, "daily", "2026-07-01.md"),
+			`${framed("old wrong fact")}\n\n${framed("keep me")}`,
+			"utf-8",
+		);
 		const result = await tools.memory_forget.execute(
 			"c1",
 			{ match: "wrong fact", target: "daily", date: "2026-07-01" },
 			null,
 			null,
-			{},
+			createMockCtx(),
 		);
-		expect(result.content[0].text).toContain("Removed 1 entry");
+		expect(result.content[0].text).toContain("Removed applicable records");
 		const remaining = fs.readFileSync(path.join(tmpDir, "daily", "2026-07-01.md"), "utf-8");
 		expect(remaining).toContain("keep me");
 		expect(remaining).not.toContain("wrong fact");
@@ -2411,7 +2457,7 @@ describe("memory_forget tool", () => {
 			{ recoveryId: result.details.recoveryId },
 			null,
 			null,
-			{},
+			createMockCtx(),
 		);
 		expect(restoreResult.content[0].text).toContain("Restored 1 entry");
 		const restored = fs.readFileSync(path.join(tmpDir, "daily", "2026-07-01.md"), "utf-8");
@@ -2420,50 +2466,62 @@ describe("memory_forget tool", () => {
 	});
 
 	test("rejects empty match and bad dates", async () => {
-		const r1 = await tools.memory_forget.execute("c1", { match: "  " }, null, null, {});
+		const r1 = await tools.memory_forget.execute("c1", { match: "  " }, null, null, createMockCtx());
 		expect(r1.isError).toBe(true);
 		const r2 = await tools.memory_forget.execute(
 			"c1",
 			{ match: "x", target: "daily", date: "not-a-date" },
 			null,
 			null,
-			{},
+			createMockCtx(),
 		);
 		expect(r2.isError).toBe(true);
 	});
 
 	test("handles empty memory gracefully", async () => {
-		const result = await tools.memory_forget.execute("c1", { match: "x" }, null, null, {});
-		expect(result.content[0].text).toContain("nothing to forget");
+		const result = await tools.memory_forget.execute("c1", { match: "x" }, null, null, createMockCtx());
+		expect(result.content[0].text).toContain("No applicable entries matched");
 	});
 
 	test("rejects invalid recovery IDs without reading outside the recovery directory", async () => {
-		const result = await tools.memory_restore.execute("c1", { recoveryId: "../../MEMORY.md" }, null, null, {});
+		const result = await tools.memory_restore.execute(
+			"c1",
+			{ recoveryId: "../../MEMORY.md" },
+			null,
+			null,
+			createMockCtx(),
+		);
 		expect(result.isError).toBe(true);
 		expect(result.content[0].text).toContain("No valid recovery record");
 	});
 
 	test("persists complete removed content and restores it by visible recovery ID", async () => {
 		const longEntry = `<!-- 2026-07-01 10:00:00 [abc] -->\nwrong fact ${"x".repeat(4500)} recovery-tail`;
-		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), longEntry, "utf-8");
-		const forgetResult = await tools.memory_forget.execute("c1", { match: "wrong fact" }, null, null, {});
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), framed(longEntry), "utf-8");
+		const forgetResult = await tools.memory_forget.execute(
+			"c1",
+			{ match: "wrong fact" },
+			null,
+			null,
+			createMockCtx(),
+		);
 		expect(forgetResult.content[0].text).not.toContain("recovery-tail");
-		expect(forgetResult.content[0].text).toContain("memory_restore");
+		expect(forgetResult.content[0].text).toContain("Recovery ID:");
 		expect(forgetResult.content[0].text).toContain(forgetResult.details.recoveryId);
 
 		const recoveryPath = path.join(tmpDir, "recovery", `${forgetResult.details.recoveryId}.json`);
 		const recovery = JSON.parse(fs.readFileSync(recoveryPath, "utf-8"));
-		expect(recovery.removedContent).toEqual([longEntry]);
+		expect(parseMemoryStore(recovery.removedContent[0]).records[0]?.content).toBe(longEntry);
 		expect(forgetResult.details.removedContent).toBeUndefined();
 
-		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "A later fact that must survive.\n", "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), framed("A later fact that must survive."), "utf-8");
 
 		const restoreResult = await tools.memory_restore.execute(
 			"c2",
 			{ recoveryId: forgetResult.details.recoveryId },
 			null,
 			null,
-			{},
+			createMockCtx(),
 		);
 		expect(restoreResult.content[0].text).toContain("Restored 1 entry");
 		const restoredMemory = fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8");
@@ -2475,7 +2533,7 @@ describe("memory_forget tool", () => {
 			{ recoveryId: forgetResult.details.recoveryId },
 			null,
 			null,
-			{},
+			createMockCtx(),
 		);
 		expect(secondRestore.content[0].text).toContain("already restored");
 	});

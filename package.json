@@ -43,7 +43,7 @@
 		"postinstall": "node scripts/postinstall.cjs",
 		"build": "tsc -p tsconfig.json --noEmit",
 		"lint": "biome check .",
-		"test": "bun test test/unit.test.ts",
+		"test": "bun test test/unit.test.ts test/store-lock.test.ts test/foundation.test.ts test/scoped-tools.test.ts test/scoped-runtime.test.ts",
 		"test:e2e": "npx tsx test/e2e.ts",
 		"test:eval": "bun test/eval-recall.ts"
 	},

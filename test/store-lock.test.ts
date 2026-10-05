@@ -5,12 +5,12 @@
  *
  * The lock exists because two pi processes pointed at one memory store used to
  * lose writes silently. The interesting properties are therefore: exclusion
- * while held, re-read *inside* the lock, reclaim after a crash, and -- most
+ * while held, re-read *inside* the lock, refusal after a crash, and -- most
  * importantly -- that a reader which takes no lock never observes a torn file.
  * All file I/O happens in temp directories.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -66,14 +66,87 @@ describe("withStoreLock", () => {
 		expect(withStoreLock(file, () => "ok", 150)).toBe("ok");
 	});
 
-	test("reclaims a lock abandoned by a crashed holder", () => {
-		process.env.PI_MEMORY_LOCK_STALE_MS = "50";
+	test("never reclaims an ancient orphan, even with the retired stale setting", () => {
+		process.env.PI_MEMORY_LOCK_STALE_MS = "1";
 		const lockDir = storeLockDir(file);
 		fs.mkdirSync(lockDir);
-		const old = new Date(Date.now() - 60_000);
+		fs.writeFileSync(path.join(lockDir, "evidence"), "orphan");
+		fs.writeFileSync(file, "unchanged");
+		const old = new Date(Date.now() - 86_400_000);
 		fs.utimesSync(lockDir, old, old);
-		expect(withStoreLock(file, () => "reclaimed", 5_000)).toBe("reclaimed");
-		expect(fs.existsSync(lockDir)).toBe(false);
+		expect(() => withStoreLock(file, () => fs.writeFileSync(file, "stolen"), 150)).toThrow(
+			/no auto.*reclaim.*confirm.*no writer/i,
+		);
+		expect(fs.readFileSync(file, "utf-8")).toBe("unchanged");
+		expect(fs.readFileSync(path.join(lockDir, "evidence"), "utf-8")).toBe("orphan");
+		expect(fs.statSync(lockDir).mtimeMs).toBe(old.getTime());
+	});
+
+	test("does not remove a lock with a changed owner token", () => {
+		const lockDir = storeLockDir(file);
+		withStoreLock(file, () => {
+			fs.writeFileSync(path.join(lockDir, "owner"), "another-owner");
+		});
+		expect(fs.readFileSync(path.join(lockDir, "owner"), "utf-8")).toBe("another-owner");
+	});
+
+	test("does not remove a replacement directory, even with a copied token", () => {
+		const lockDir = storeLockDir(file);
+		withStoreLock(file, () => {
+			const token = fs.readFileSync(path.join(lockDir, "owner"), "utf-8");
+			fs.renameSync(lockDir, `${lockDir}.old`);
+			fs.mkdirSync(lockDir);
+			fs.writeFileSync(path.join(lockDir, "owner"), token);
+		});
+		expect(fs.existsSync(path.join(lockDir, "owner"))).toBe(true);
+	});
+
+	test("cleans its directory if owner metadata initialization fails", () => {
+		const originalWrite = fs.writeFileSync;
+		const write = spyOn(fs, "writeFileSync").mockImplementation((destination) => {
+			// Simulate a failure after writing only part of the token.
+			originalWrite(destination, "partial", "utf-8");
+			throw new Error("metadata write failed");
+		});
+		try {
+			expect(() => withStoreLock(file, () => "must not run")).toThrow("metadata write failed");
+		} finally {
+			write.mockRestore();
+		}
+		expect(fs.existsSync(storeLockDir(file))).toBe(false);
+	});
+
+	test("cleans its empty directory if owner metadata cannot be opened", () => {
+		const open = spyOn(fs, "openSync").mockImplementation(() => {
+			throw new Error("metadata open failed");
+		});
+		try {
+			expect(() => withStoreLock(file, () => "must not run")).toThrow("metadata open failed");
+		} finally {
+			open.mockRestore();
+		}
+		expect(fs.existsSync(storeLockDir(file))).toBe(false);
+	});
+
+	test("rejects invalid timeout configuration before entering or creating a lock", () => {
+		for (const value of ["NaN", "Infinity", "-Infinity", "0", "-1", "", "300001"]) {
+			process.env.PI_MEMORY_LOCK_TIMEOUT_MS = value;
+			expect(() => withStoreLock(file, () => "must not run")).toThrow(/timeout/i);
+			expect(fs.existsSync(storeLockDir(file))).toBe(false);
+		}
+		for (const value of [NaN, Infinity, 0, -1, 300_001]) {
+			expect(() => withStoreLock(file, () => "must not run", value)).toThrow(/timeout/i);
+		}
+		// Invalid budgets must also reject immediately on a contended lock,
+		// without altering either the existing lock or the target.
+		fs.mkdirSync(storeLockDir(file));
+		fs.writeFileSync(file, "unchanged");
+		for (const value of ["NaN", "Infinity"]) {
+			process.env.PI_MEMORY_LOCK_TIMEOUT_MS = value;
+			expect(() => withStoreLock(file, () => fs.writeFileSync(file, "changed"))).toThrow(/timeout/i);
+		}
+		expect(fs.readFileSync(file, "utf-8")).toBe("unchanged");
+		expect(fs.readdirSync(storeLockDir(file))).toEqual([]);
 	});
 
 	test("does not steal a lock that is merely fresh", () => {
@@ -97,11 +170,9 @@ describe("withStoreLock", () => {
 		expect(fs.existsSync(path.join(dir, "does", "not", "exist", "daily"))).toBe(true);
 	});
 
-	test("keeps a slow critical section from looking abandoned", async () => {
-		// Threshold 3s, heartbeat at 1s. The holder lives in another process
-		// because the critical section blocks its thread. Without the heartbeat
-		// the lock would look abandoned at 3s and this writer would barge in
-		// mid-write instead of queueing.
+	test("never enters while a synchronous holder blocks beyond the former stale threshold", async () => {
+		// Atomics.wait blocks the child's event loop: no timer can establish liveness.
+		// The contender must time out, not enter while the holder is still working.
 		const holderScript = path.join(dir, "holder.mjs");
 		fs.writeFileSync(
 			holderScript,
@@ -111,16 +182,19 @@ describe("withStoreLock", () => {
 				`const [file, ms] = process.argv.slice(2);`,
 				`withStoreLock(file, () => {`,
 				`  fs.writeFileSync(${JSON.stringify(path.join(dir, "acquired"))}, "1");`,
-				`  const until = Date.now() + Number(ms);`,
-				`  while (Date.now() < until) { /* hold */ }`,
+				`  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(ms));`,
 				`});`,
 			].join("\n"),
 			"utf-8",
 		);
 		const acquired = path.join(dir, "acquired");
-		const holder = spawn(process.execPath, [holderScript, file, "4500"], {
+		const holder = spawn(process.execPath, [holderScript, file, "1500"], {
 			stdio: ["ignore", "ignore", "inherit"],
-			env: { ...process.env, PI_MEMORY_LOCK_STALE_MS: "3000" },
+			env: { ...process.env, PI_MEMORY_LOCK_STALE_MS: "50" },
+		});
+		const exited = new Promise<number>((resolve, reject) => {
+			holder.on("error", reject);
+			holder.on("exit", (code) => resolve(code ?? -1));
 		});
 		// Wait until the holder actually owns the lock.
 		for (let i = 0; i < 200 && !fs.existsSync(acquired); i++) {
@@ -128,20 +202,41 @@ describe("withStoreLock", () => {
 		}
 		expect(fs.existsSync(acquired)).toBe(true);
 
-		const startedAt = Date.now();
-		const second = withStoreLock(file, () => "second", 20_000);
-		const waited = Date.now() - startedAt;
-		const exit = await new Promise<number>((resolve) => holder.on("exit", (code) => resolve(code ?? -1)));
-
-		expect(second).toBe("second");
-		expect(exit).toBe(0);
-		// It queued for the rest of the holder's 4.5s rather than stealing a lock
-		// that was merely slow.
-		expect(waited).toBeGreaterThan(1_500);
+		process.env.PI_MEMORY_LOCK_STALE_MS = "50";
+		let entered = false;
+		try {
+			expect(() =>
+				withStoreLock(
+					file,
+					() => {
+						entered = true;
+					},
+					400,
+				),
+			).toThrow(/Timed out/);
+			expect(entered).toBe(false);
+			expect(fs.existsSync(storeLockDir(file))).toBe(true);
+		} finally {
+			expect(await exited).toBe(0);
+		}
+		expect(fs.existsSync(storeLockDir(file))).toBe(false);
+		expect(withStoreLock(file, () => "next", 150)).toBe("next");
 	});
 });
 
 describe("renameWithRetry", () => {
+	test("rejects nonfinite or unreasonable retry budgets without calling rename", () => {
+		for (const budget of [NaN, Infinity, -1, 300_001]) {
+			let called = false;
+			expect(() =>
+				renameWithRetry("unused", "unused", budget, () => {
+					called = true;
+				}),
+			).toThrow(/budget/i);
+			expect(called).toBe(false);
+		}
+	});
+
 	test("retries a transient share violation and then succeeds", () => {
 		const from = path.join(dir, "a.tmp");
 		const to = path.join(dir, "b");

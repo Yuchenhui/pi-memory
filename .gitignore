@@ -3,3 +3,5 @@ node_modules/
 *.d.ts
 *.map
 .codegraph
+__pycache__/
+*.pyc
